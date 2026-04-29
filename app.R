@@ -2,8 +2,7 @@ options(stringsAsFactors = FALSE)
 
 # ==========================================================
 # Carolina Hurricanes F&B Analytics Shiny App
-# Full client-ready app for RQ1, RQ2, and RQ3
-# Keeps the same simple Shiny theme style (fluidPage + default look)
+# RQ1, RQ2, and RQ3
 # Author: Saurabh Gupta
 # Date: Apr 26
 # ==========================================================
@@ -332,7 +331,7 @@ ui <- fluidPage(
                   value = c(floor(min(event_master$total_attendance, na.rm = TRUE)),
                             ceiling(max(event_master$total_attendance, na.rm = TRUE)))),
       hr(),
-
+      
       h4("Global Scenario Controls"),
       sliderInput("global_attendance_scn", "Scenario attendance",
                   min = floor(min(event_master$total_attendance, na.rm = TRUE)),
@@ -342,19 +341,19 @@ ui <- fluidPage(
       checkboxInput("global_playoff_scn", "Scenario is playoff", value = FALSE),
       selectInput("global_season_scn", "Scenario season year", choices = all_seasons, selected = tail(all_seasons, 1)),
       hr(),
-
+      
       h4("RQ1 Controls"),
       selectInput("rq1_category", "Category:", choices = all_categories, selected = all_categories[1]),
       sliderInput("rq1_price_change", "Category price change scenario (%)",
                   min = -20, max = 25, value = 10, step = 1),
       hr(),
-
+      
       h4("RQ2 Controls"),
       selectInput("rq2_item", "Item:", choices = all_items, selected = storm_default),
       sliderInput("rq2_price_change", "Item price change scenario (%)",
                   min = -20, max = 30, value = 10, step = 1),
       hr(),
-
+      
       h4("RQ3 Controls"),
       sliderInput("rq3_ticket_price", "Scenario average ticket price ($)",
                   min = floor(min(rq3_event$avg_ticket_price, na.rm = TRUE)),
@@ -363,7 +362,7 @@ ui <- fluidPage(
       sliderInput("rq3_ticket_change", "Ticket price change scenario (%)",
                   min = -20, max = 30, value = 10, step = 1)
     ),
-
+    
     mainPanel(
       tabsetPanel(
         tabPanel(
@@ -380,7 +379,7 @@ ui <- fluidPage(
           h4("Key business summary"),
           verbatimTextOutput("overview_text")
         ),
-
+        
         tabPanel(
           "EDA",
           br(),
@@ -390,7 +389,7 @@ ui <- fluidPage(
           plotOutput("eda_category_rev_plot", height = 320),
           plotOutput("eda_time_plot", height = 320)
         ),
-
+        
         tabPanel(
           "RQ1 Category Elasticity",
           br(),
@@ -408,7 +407,7 @@ ui <- fluidPage(
           plotOutput("rq1_resid_plot", height = 320),
           plotOutput("rq1_qq_plot", height = 320)
         ),
-
+        
         tabPanel(
           "RQ2 Item Elasticity",
           br(),
@@ -427,11 +426,13 @@ ui <- fluidPage(
           plotOutput("rq2_price_time", height = 320),
           h4("Actual vs fitted quantity per capita"),
           plotOutput("rq2_actual_fitted", height = 320),
+          h4("Posterior distribution"),
+          plotOutput("rq2_posterior_plot", height = 320),
           h4("Model diagnostics"),
           plotOutput("rq2_resid_plot", height = 320),
           plotOutput("rq2_qq_plot", height = 320)
         ),
-
+        
         tabPanel(
           "RQ3 Event Drivers",
           br(),
@@ -450,14 +451,14 @@ ui <- fluidPage(
           plotOutput("rq3_resid_plot", height = 320),
           plotOutput("rq3_qq_plot", height = 320)
         ),
-
+        
         tabPanel(
           "Compare Categories",
           br(),
           plotOutput("compare_plot", height = 420),
           tableOutput("compare_table")
         ),
-
+        
         tabPanel(
           "Data",
           br(),
@@ -484,7 +485,7 @@ ui <- fluidPage(
 # server
 # -----------------------------
 server <- function(input, output, session) {
-
+  
   current_data <- reactive({
     cg <- category_game %>%
       filter(
@@ -492,38 +493,38 @@ server <- function(input, output, session) {
         total_attendance >= input$attendance_range[1],
         total_attendance <= input$attendance_range[2]
       )
-
+    
     ig <- item_game %>%
       filter(
         as.character(season_year) %in% input$season_filter,
         total_attendance >= input$attendance_range[1],
         total_attendance <= input$attendance_range[2]
       )
-
+    
     ev <- rq3_event %>%
       filter(
         as.character(season_year) %in% input$season_filter,
         total_attendance >= input$attendance_range[1],
         total_attendance <= input$attendance_range[2]
       )
-
+    
     if (!isTRUE(input$include_playoffs)) {
       cg <- cg %>% filter(as.character(is_playoff) == "0")
       ig <- ig %>% filter(as.character(is_playoff) == "0")
       ev <- ev %>% filter(as.character(is_playoff) == "0")
     }
-
+    
     list(category_game = cg, item_game = ig, rq3_event = ev)
   })
-
+  
   rq1_data <- reactive({
     current_data()$category_game %>% filter(category == input$rq1_category)
   })
-
+  
   rq2_data <- reactive({
     current_data()$item_game %>% filter(item_name == input$rq2_item)
   })
-
+  
   build_formula <- function(outcome, data, candidates) {
     valid_terms <- sapply(candidates, function(term) {
       col <- data[[term]]
@@ -536,7 +537,7 @@ server <- function(input, output, session) {
     kept <- candidates[valid_terms]
     as.formula(paste(outcome, "~", paste(kept, collapse = " + ")))
   }
-
+  
   rq1_model <- reactive({
     req(nrow(rq1_data()) >= 8)
     f <- build_formula(
@@ -547,8 +548,21 @@ server <- function(input, output, session) {
     )
     lm(f, data = rq1_data())
   })
-
-  rq2_model <- reactive({
+  
+  # -----------------------------
+  # RQ2 Bayesian item-level model
+  # -----------------------------
+  # Report/PPT logic:
+  # 1) Fit the item-level log-log model. This gives the item likelihood.
+  # 2) Fit the matching category-level log-log model from RQ1. This gives the prior mean.
+  # 3) Combine prior + likelihood with a normal-normal Bayesian update.
+  #    This gives a posterior elasticity estimate and 95% credible interval.
+  #
+  # Note: This is a lightweight Shiny implementation of the Bayesian borrowing-strength
+  # idea used in the report. It does not run a full Bayesian LASSO MCMC each time,
+  # because that would make the app much slower and require extra Bayesian packages.
+  
+  rq2_item_likelihood_model <- reactive({
     req(nrow(rq2_data()) >= 10)
     f <- build_formula(
       "log_qty_per_capita",
@@ -558,7 +572,91 @@ server <- function(input, output, session) {
     )
     lm(f, data = rq2_data())
   })
-
+  
+  rq2_prior_category_data <- reactive({
+    item_cat <- rq2_data() %>% pull(category) %>% unique() %>% .[1]
+    req(!is.na(item_cat))
+    current_data()$category_game %>% filter(category == item_cat)
+  })
+  
+  rq2_category_prior_model <- reactive({
+    d <- rq2_prior_category_data()
+    req(nrow(d) >= 8)
+    f <- build_formula(
+      "log_qty_per_capita",
+      d,
+      c("log_avg_price", "log_attendance", "log_avg_ticket_price",
+        "is_playoff", "is_weekend", "season_year", "season_tercile")
+    )
+    lm(f, data = d)
+  })
+  
+  rq2_model <- reactive({
+    item_model <- rq2_item_likelihood_model()
+    prior_model <- rq2_category_prior_model()
+    
+    item_coef <- coef(summary(item_model))
+    prior_coef <- coef(summary(prior_model))
+    
+    req("log_avg_price" %in% rownames(item_coef))
+    req("log_avg_price" %in% rownames(prior_coef))
+    
+    likelihood_mean <- item_coef["log_avg_price", "Estimate"]
+    likelihood_se   <- item_coef["log_avg_price", "Std. Error"]
+    
+    prior_mean <- prior_coef["log_avg_price", "Estimate"]
+    prior_se   <- prior_coef["log_avg_price", "Std. Error"]
+    
+    # Safety fallback if a standard error is missing or extremely small.
+    if (is.na(likelihood_se) || likelihood_se <= 0) likelihood_se <- 1
+    if (is.na(prior_se) || prior_se <= 0) prior_se <- 1
+    
+    likelihood_var <- likelihood_se^2
+    prior_var <- prior_se^2
+    
+    posterior_var <- 1 / ((1 / prior_var) + (1 / likelihood_var))
+    posterior_mean <- posterior_var * ((prior_mean / prior_var) + (likelihood_mean / likelihood_var))
+    posterior_sd <- sqrt(posterior_var)
+    
+    set.seed(542)
+    posterior_draws <- rnorm(5000, mean = posterior_mean, sd = posterior_sd)
+    posterior_ci <- quantile(posterior_draws, probs = c(0.025, 0.975), na.rm = TRUE)
+    
+    list(
+      item_model = item_model,
+      prior_model = prior_model,
+      prior_category = unique(rq2_data()$category)[1],
+      prior_mean = prior_mean,
+      prior_sd = prior_se,
+      likelihood_mean = likelihood_mean,
+      likelihood_sd = likelihood_se,
+      posterior_mean = posterior_mean,
+      posterior_sd = posterior_sd,
+      posterior_ci = posterior_ci,
+      posterior_draws = posterior_draws
+    )
+  })
+  
+  rq2_posterior_fitted_log <- reactive({
+    bm <- rq2_model()
+    item_model <- bm$item_model
+    if ("log_avg_price" %in% names(coef(item_model))) {
+      as.numeric(fitted(item_model) +
+                   (bm$posterior_mean - bm$likelihood_mean) * item_model$model$log_avg_price)
+    } else {
+      as.numeric(fitted(item_model))
+    }
+  })
+  
+  rq2_predict_posterior <- function(bm, newdata) {
+    item_model <- bm$item_model
+    pred_log <- as.numeric(predict(item_model, newdata = newdata))
+    if ("log_avg_price" %in% names(coef(item_model))) {
+      pred_log <- pred_log + (bm$posterior_mean - bm$likelihood_mean) * newdata$log_avg_price
+    }
+    exp(pred_log)
+  }
+  
   rq3_model <- reactive({
     req(nrow(current_data()$rq3_event) >= 10)
     f <- build_formula(
@@ -569,7 +667,7 @@ server <- function(input, output, session) {
     )
     lm(f, data = current_data()$rq3_event)
   })
-
+  
   # Overview
   output$overview_table <- renderTable({
     data.frame(
@@ -589,19 +687,19 @@ server <- function(input, output, session) {
       )
     )
   })
-
+  
   output$overview_text <- renderText({
     avg_rev <- mean(current_data()$rq3_event$fnb_rev_per_cap, na.rm = TRUE)
     avg_ticket <- mean(current_data()$rq3_event$avg_ticket_price, na.rm = TRUE)
     avg_att <- mean(current_data()$rq3_event$total_attendance, na.rm = TRUE)
-
+    
     paste0(
       "In the filtered sample, average F&B revenue per attendee is $", round(avg_rev, 2),
       ", average ticket price is $", round(avg_ticket, 2),
       ", and average attendance is ", comma(round(avg_att, 0)), "."
     )
   })
-
+  
   # EDA
   output$eda_rev_ticket_plot <- renderPlot({
     ggplot(current_data()$rq3_event,
@@ -616,7 +714,7 @@ server <- function(input, output, session) {
       ) +
       theme_minimal()
   })
-
+  
   output$eda_price_box_plot <- renderPlot({
     ggplot(current_data()$category_game, aes(x = category, y = avg_price, fill = category)) +
       geom_boxplot(alpha = 0.8) +
@@ -628,13 +726,13 @@ server <- function(input, output, session) {
       theme_minimal() +
       theme(legend.position = "none", axis.text.x = element_text(angle = 40, hjust = 1))
   })
-
+  
   output$eda_category_rev_plot <- renderPlot({
     summary_df <- current_data()$category_game %>%
       group_by(category) %>%
       summarise(rev_per_capita = mean(rev_per_capita, na.rm = TRUE), .groups = "drop") %>%
       arrange(desc(rev_per_capita))
-
+    
     ggplot(summary_df, aes(x = reorder(category, rev_per_capita), y = rev_per_capita, fill = category)) +
       geom_col(alpha = 0.85) +
       coord_flip() +
@@ -646,7 +744,7 @@ server <- function(input, output, session) {
       theme_minimal() +
       theme(legend.position = "none")
   })
-
+  
   output$eda_time_plot <- renderPlot({
     ggplot(current_data()$rq3_event, aes(x = event_date, y = fnb_rev_per_cap, color = season_year)) +
       geom_line(alpha = 0.7) +
@@ -659,7 +757,7 @@ server <- function(input, output, session) {
       ) +
       theme_minimal()
   })
-
+  
   # RQ1
   output$rq1_stats <- renderTable({
     model <- rq1_model()
@@ -678,7 +776,7 @@ server <- function(input, output, session) {
       )
     )
   })
-
+  
   output$rq1_scatter <- renderPlot({
     ggplot(rq1_data(), aes(x = avg_price, y = qty_per_capita, color = is_playoff)) +
       geom_point(alpha = 0.75, size = 2) +
@@ -691,7 +789,7 @@ server <- function(input, output, session) {
       ) +
       theme_minimal()
   })
-
+  
   output$rq1_actual_fitted <- renderPlot({
     d <- rq1_data() %>% mutate(fitted = exp(fitted(rq1_model())))
     ggplot(d, aes(x = qty_per_capita, y = fitted)) +
@@ -704,7 +802,7 @@ server <- function(input, output, session) {
       ) +
       theme_minimal()
   })
-
+  
   output$rq1_resid_plot <- renderPlot({
     aug <- broom::augment(rq1_model())
     ggplot(aug, aes(x = .fitted, y = .resid)) +
@@ -717,7 +815,7 @@ server <- function(input, output, session) {
       ) +
       theme_minimal()
   })
-
+  
   output$rq1_qq_plot <- renderPlot({
     aug <- broom::augment(rq1_model())
     ggplot(aug, aes(sample = .std.resid)) +
@@ -726,18 +824,18 @@ server <- function(input, output, session) {
       labs(title = "Normal Q-Q Plot", x = "Theoretical Quantiles", y = "Standardized Residuals") +
       theme_minimal()
   })
-
+  
   output$rq1_prediction_table <- renderTable({
     d <- rq1_data()
     base_price <- mean(d$avg_price, na.rm = TRUE)
     scenario_price <- base_price * (1 + input$rq1_price_change / 100)
-
+    
     scn_attendance <- isolate(input$global_attendance_scn)
     scn_ticket     <- isolate(input$rq3_ticket_price)
     scn_playoff    <- isolate(input$global_playoff_scn)
     scn_weekend    <- isolate(input$global_weekend_scn)
     scn_season     <- isolate(input$global_season_scn)
-
+    
     newdata <- tibble(
       log_avg_price = log(scenario_price),
       log_attendance = log(scn_attendance),
@@ -747,13 +845,13 @@ server <- function(input, output, session) {
       season_year = factor(scn_season, levels = all_seasons),
       season_tercile = factor("Middle", levels = all_terciles)
     )
-
+    
     pred <- predict_backtransform(rq1_model(), newdata)
     qty_pc <- pred$fit_response[1]
     total_qty <- qty_pc * scn_attendance
     total_rev <- total_qty * scenario_price
     beta <- coef(rq1_model())["log_avg_price"]
-
+    
     data.frame(
       Measure = c(
         "Baseline average price",
@@ -773,7 +871,7 @@ server <- function(input, output, session) {
       )
     )
   })
-
+  
   output$rq1_text <- renderText({
     beta <- coef(rq1_model())["log_avg_price"]
     q_change <- round(beta * input$rq1_price_change, 1)
@@ -785,43 +883,61 @@ server <- function(input, output, session) {
       "% using the elasticity-based revenue approximation. Positive estimates should be interpreted cautiously because high-demand games can push both price and sales upward."
     )
   })
-
+  
   output$rq1_model_output <- renderPrint({
     summary(rq1_model())
   })
-
+  
   # RQ2
   output$rq2_stats <- renderTable({
-    model <- rq2_model()
-    beta <- coef(model)["log_avg_price"]
+    bm <- rq2_model()
     item_df <- rq2_data()
+    fitted_response <- exp(rq2_posterior_fitted_log())
+    
     data.frame(
-      Metric = c("Games", "Category", "Elasticity", "Elasticity type", "R-squared", "RMSE (response)", "MAPE (%)"),
+      Metric = c(
+        "Games",
+        "Category",
+        "Prior source",
+        "Prior elasticity from RQ1 category model",
+        "Item likelihood elasticity",
+        "Posterior elasticity",
+        "95% credible interval",
+        "Elasticity type",
+        "Item likelihood R-squared",
+        "Posterior RMSE (response)",
+        "Posterior MAPE (%)"
+      ),
       Value = c(
         nrow(item_df),
         unique(item_df$category)[1],
-        round(beta, 3),
-        elasticity_label(beta),
-        round(summary(model)$r.squared, 3),
-        round(rmse(exp(model$model$log_qty_per_capita), exp(fitted(model))), 4),
-        round(mape(exp(model$model$log_qty_per_capita), exp(fitted(model))), 2)
+        paste0("RQ1 category model: ", bm$prior_category),
+        round(bm$prior_mean, 3),
+        round(bm$likelihood_mean, 3),
+        round(bm$posterior_mean, 3),
+        paste0("(", round(bm$posterior_ci[1], 3), ", ", round(bm$posterior_ci[2], 3), ")"),
+        elasticity_label(bm$posterior_mean),
+        round(summary(bm$item_model)$r.squared, 3),
+        round(rmse(exp(item_df$log_qty_per_capita), fitted_response), 4),
+        round(mape(exp(item_df$log_qty_per_capita), fitted_response), 2)
       )
     )
   })
-
+  
   output$rq2_scatter <- renderPlot({
     ggplot(rq2_data(), aes(x = avg_price, y = qty_per_capita, color = season_year)) +
       geom_point(alpha = 0.75, size = 2) +
       geom_smooth(method = "lm", se = FALSE) +
       labs(
         title = paste("Item Price vs Quantity per Capita -", input$rq2_item),
+        subtitle = "Observed item-game data. Posterior elasticity is reported in the summary table.",
         x = "Average Price ($)",
         y = "Quantity per Capita",
         color = "Season"
       ) +
       theme_minimal()
   })
-
+  
   output$rq2_price_time <- renderPlot({
     ggplot(rq2_data() %>% arrange(event_date), aes(x = event_date, y = avg_price, color = season_year)) +
       geom_line(alpha = 0.75) +
@@ -834,45 +950,86 @@ server <- function(input, output, session) {
       ) +
       theme_minimal()
   })
-
+  
   output$rq2_actual_fitted <- renderPlot({
-    d <- rq2_data() %>% mutate(fitted = exp(fitted(rq2_model())))
+    d <- rq2_data() %>% mutate(fitted = exp(rq2_posterior_fitted_log()))
     ggplot(d, aes(x = qty_per_capita, y = fitted)) +
       geom_point(alpha = 0.75) +
       geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-      labs(title = "Actual vs Fitted Quantity per Capita", x = "Actual", y = "Fitted") +
+      labs(
+        title = "Actual vs Posterior Fitted Quantity per Capita",
+        x = "Actual",
+        y = "Posterior fitted"
+      ) +
       theme_minimal()
   })
-
+  
+  output$rq2_posterior_plot <- renderPlot({
+    bm <- rq2_model()
+    draws <- tibble(elasticity = bm$posterior_draws)
+    
+    ggplot(draws, aes(x = elasticity)) +
+      geom_density(alpha = 0.35, fill = "gray70") +
+      geom_vline(xintercept = bm$posterior_mean, linetype = "solid") +
+      geom_vline(xintercept = bm$posterior_ci, linetype = "dashed") +
+      geom_vline(xintercept = 0, linetype = "dotted") +
+      labs(
+        title = paste("Posterior Distribution of Item Elasticity -", input$rq2_item),
+        subtitle = paste0(
+          "Prior from ", bm$prior_category,
+          " category model; dashed lines show 95% credible interval; dotted line is zero."
+        ),
+        x = "Elasticity",
+        y = "Posterior density"
+      ) +
+      theme_minimal()
+  })
+  
   output$rq2_resid_plot <- renderPlot({
-    aug <- broom::augment(rq2_model())
-    ggplot(aug, aes(x = .fitted, y = .resid)) +
+    d <- rq2_data() %>%
+      mutate(
+        .fitted = rq2_posterior_fitted_log(),
+        .resid = log_qty_per_capita - .fitted
+      )
+    
+    ggplot(d, aes(x = .fitted, y = .resid)) +
       geom_point(alpha = 0.75) +
       geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-      labs(title = "Residuals vs Fitted", x = "Fitted values", y = "Residuals") +
+      labs(
+        title = "Residuals vs Posterior Fitted Values",
+        x = "Posterior fitted log quantity per capita",
+        y = "Residuals"
+      ) +
       theme_minimal()
   })
-
+  
   output$rq2_qq_plot <- renderPlot({
-    aug <- broom::augment(rq2_model())
-    ggplot(aug, aes(sample = .std.resid)) +
+    d <- rq2_data() %>%
+      mutate(
+        .fitted = rq2_posterior_fitted_log(),
+        .resid = log_qty_per_capita - .fitted,
+        .std_resid = as.numeric(scale(.resid))
+      )
+    
+    ggplot(d, aes(sample = .std_resid)) +
       stat_qq() +
       stat_qq_line() +
       labs(title = "Normal Q-Q Plot", x = "Theoretical Quantiles", y = "Standardized Residuals") +
       theme_minimal()
   })
-
+  
   output$rq2_prediction_table <- renderTable({
+    bm <- rq2_model()
     d <- rq2_data()
     base_price <- mean(d$avg_price, na.rm = TRUE)
     scenario_price <- base_price * (1 + input$rq2_price_change / 100)
-
-    scn_attendance <- isolate(input$global_attendance_scn)
-    scn_ticket     <- isolate(input$rq3_ticket_price)
-    scn_playoff    <- isolate(input$global_playoff_scn)
-    scn_weekend    <- isolate(input$global_weekend_scn)
-    scn_season     <- isolate(input$global_season_scn)
-
+    
+    scn_attendance <- input$global_attendance_scn
+    scn_ticket     <- input$rq3_ticket_price
+    scn_playoff    <- input$global_playoff_scn
+    scn_weekend    <- input$global_weekend_scn
+    scn_season     <- input$global_season_scn
+    
     newdata <- tibble(
       log_avg_price = log(scenario_price),
       log_attendance = log(scn_attendance),
@@ -882,13 +1039,12 @@ server <- function(input, output, session) {
       season_year = factor(scn_season, levels = all_seasons),
       season_tercile = factor("Middle", levels = all_terciles)
     )
-
-    pred <- predict_backtransform(rq2_model(), newdata)
-    qty_pc <- pred$fit_response[1]
+    
+    qty_pc <- rq2_predict_posterior(bm, newdata)[1]
     total_qty <- qty_pc * scn_attendance
     total_rev <- total_qty * scenario_price
-    beta <- coef(rq2_model())["log_avg_price"]
-
+    beta <- bm$posterior_mean
+    
     data.frame(
       Measure = c(
         "Baseline average price",
@@ -896,7 +1052,7 @@ server <- function(input, output, session) {
         "Predicted quantity per capita",
         "Predicted total quantity",
         "Predicted total revenue",
-        "Revenue change from elasticity formula (%)"
+        "Revenue change from posterior elasticity (%)"
       ),
       Value = c(
         dollar(base_price),
@@ -908,23 +1064,55 @@ server <- function(input, output, session) {
       )
     )
   })
-
+  
   output$rq2_text <- renderText({
-    beta <- coef(rq2_model())["log_avg_price"]
+    bm <- rq2_model()
+    beta <- bm$posterior_mean
     q_change <- round(beta * input$rq2_price_change, 1)
     r_change <- round(revenue_change_pct(input$rq2_price_change, beta), 1)
+    ci_text <- paste0("(", round(bm$posterior_ci[1], 3), ", ", round(bm$posterior_ci[2], 3), ")")
+    
     paste0(
-      "For item ", input$rq2_item, ", the estimated item-level price coefficient is ", round(beta, 3),
-      ". Under a ", input$rq2_price_change, "% price change scenario, quantity is expected to change by about ",
+      "For item ", input$rq2_item,
+      ", RQ2 uses a Bayesian borrowing-strength estimate instead of a plain item-only regression. ",
+      "The prior comes from the RQ1 category model for ", bm$prior_category,
+      ", and the likelihood comes from the selected item's log-log model. ",
+      "The posterior elasticity estimate is ", round(beta, 3),
+      " with a 95% credible interval of ", ci_text, ". Under a ",
+      input$rq2_price_change, "% price change scenario, quantity is expected to change by about ",
       q_change, "% and revenue by about ", r_change,
-      "%. This item-level model is most useful for items with real price movement across games and across seasons."
+      "%. If the estimate is positive or if the credible interval includes zero, interpret it cautiously because game context, playoff demand, popularity, and limited price variation may still be driving the signal."
     )
   })
-
+  
   output$rq2_model_output <- renderPrint({
-    summary(rq2_model())
+    bm <- rq2_model()
+    cat("RQ2 Bayesian item-level elasticity summary\n")
+    cat("=========================================\n")
+    cat("Selected item: ", input$rq2_item, "\n", sep = "")
+    cat("Prior category: ", bm$prior_category, "\n\n", sep = "")
+    
+    cat("Prior elasticity from RQ1 category model:\n")
+    cat("  Mean = ", round(bm$prior_mean, 4), "\n", sep = "")
+    cat("  SD   = ", round(bm$prior_sd, 4), "\n\n", sep = "")
+    
+    cat("Item likelihood elasticity from item-level log-log regression:\n")
+    cat("  Mean = ", round(bm$likelihood_mean, 4), "\n", sep = "")
+    cat("  SD   = ", round(bm$likelihood_sd, 4), "\n\n", sep = "")
+    
+    cat("Posterior elasticity estimate:\n")
+    cat("  Mean = ", round(bm$posterior_mean, 4), "\n", sep = "")
+    cat("  SD   = ", round(bm$posterior_sd, 4), "\n", sep = "")
+    cat("  95% credible interval = (", round(bm$posterior_ci[1], 4), ", ",
+        round(bm$posterior_ci[2], 4), ")\n\n", sep = "")
+    
+    cat("Item-level likelihood model output:\n")
+    print(summary(bm$item_model))
+    
+    cat("\nPrior category model output:\n")
+    print(summary(bm$prior_model))
   })
-
+  
   # RQ3
   output$rq3_stats <- renderTable({
     model <- rq3_model()
@@ -942,7 +1130,7 @@ server <- function(input, output, session) {
       )
     )
   })
-
+  
   output$rq3_scatter <- renderPlot({
     ggplot(current_data()$rq3_event, aes(x = avg_ticket_price, y = fnb_rev_per_cap, color = is_playoff)) +
       geom_point(alpha = 0.75, size = 2) +
@@ -955,11 +1143,11 @@ server <- function(input, output, session) {
       ) +
       theme_minimal()
   })
-
+  
   output$rq3_coef_plot <- renderPlot({
     coef_df <- broom::tidy(rq3_model(), conf.int = TRUE) %>%
       filter(term != "(Intercept)")
-
+    
     ggplot(coef_df, aes(x = estimate, y = reorder(term, estimate))) +
       geom_point() +
       geom_errorbarh(aes(xmin = conf.low, xmax = conf.high), height = 0.2) +
@@ -967,7 +1155,7 @@ server <- function(input, output, session) {
       labs(title = "Coefficient Plot", x = "Estimate", y = "Predictor") +
       theme_minimal()
   })
-
+  
   output$rq3_actual_fitted <- renderPlot({
     d <- current_data()$rq3_event %>% mutate(fitted = exp(fitted(rq3_model())))
     ggplot(d, aes(x = fnb_rev_per_cap, y = fitted)) +
@@ -976,7 +1164,7 @@ server <- function(input, output, session) {
       labs(title = "Actual vs Fitted F&B Revenue per Capita", x = "Actual", y = "Fitted") +
       theme_minimal()
   })
-
+  
   output$rq3_resid_plot <- renderPlot({
     aug <- broom::augment(rq3_model())
     ggplot(aug, aes(x = .fitted, y = .resid)) +
@@ -985,7 +1173,7 @@ server <- function(input, output, session) {
       labs(title = "Residuals vs Fitted", x = "Fitted values", y = "Residuals") +
       theme_minimal()
   })
-
+  
   output$rq3_qq_plot <- renderPlot({
     aug <- broom::augment(rq3_model())
     ggplot(aug, aes(sample = .std.resid)) +
@@ -994,19 +1182,19 @@ server <- function(input, output, session) {
       labs(title = "Normal Q-Q Plot", x = "Theoretical Quantiles", y = "Standardized Residuals") +
       theme_minimal()
   })
-
+  
   output$rq3_prediction_table <- renderTable({
     base_ticket <- mean(current_data()$rq3_event$avg_ticket_price, na.rm = TRUE)
-
-    scn_attendance <- isolate(input$global_attendance_scn)
-    scn_playoff    <- isolate(input$global_playoff_scn)
-    scn_weekend    <- isolate(input$global_weekend_scn)
-    scn_season     <- isolate(input$global_season_scn)
-    scn_ticket     <- isolate(input$rq3_ticket_price)
-    scn_ticket_chg <- isolate(input$rq3_ticket_change)
-
+    
+    scn_attendance <- input$global_attendance_scn
+    scn_playoff    <- input$global_playoff_scn
+    scn_weekend    <- input$global_weekend_scn
+    scn_season     <- input$global_season_scn
+    scn_ticket     <- input$rq3_ticket_price
+    scn_ticket_chg <- input$rq3_ticket_change
+    
     scenario_ticket <- scn_ticket * (1 + scn_ticket_chg / 100)
-
+    
     newdata <- tibble(
       log_avg_ticket_price = log(scenario_ticket),
       log_attendance = log(scn_attendance),
@@ -1015,12 +1203,12 @@ server <- function(input, output, session) {
       season_tercile = factor("Middle", levels = all_terciles),
       season_year = factor(scn_season, levels = all_seasons)
     )
-
+    
     pred <- predict_backtransform(rq3_model(), newdata)
     rev_pc <- pred$fit_response[1]
     total_rev <- rev_pc * scn_attendance
     beta <- coef(rq3_model())["log_avg_ticket_price"]
-
+    
     data.frame(
       Measure = c(
         "Average ticket price baseline",
@@ -1038,7 +1226,7 @@ server <- function(input, output, session) {
       )
     )
   })
-
+  
   output$rq3_text <- renderText({
     beta <- coef(rq3_model())["log_avg_ticket_price"]
     chg  <- isolate(input$rq3_ticket_change)
@@ -1050,11 +1238,11 @@ server <- function(input, output, session) {
       "% change in F&B revenue per attendee, holding the other included factors constant."
     )
   })
-
+  
   output$rq3_model_output <- renderPrint({
     summary(rq3_model())
   })
-
+  
   # Compare categories
   compare_df <- reactive({
     cats <- sort(unique(current_data()$category_game$category))
@@ -1084,7 +1272,7 @@ server <- function(input, output, session) {
       )
     }))
   })
-
+  
   output$compare_plot <- renderPlot({
     d <- compare_df()
     ggplot(d, aes(x = elasticity, y = reorder(category, elasticity))) +
@@ -1095,7 +1283,7 @@ server <- function(input, output, session) {
       labs(title = "Category Elasticity Comparison", x = "Elasticity Estimate", y = "Category") +
       theme_minimal()
   })
-
+  
   output$compare_table <- renderTable({
     compare_df() %>%
       mutate(
@@ -1107,7 +1295,7 @@ server <- function(input, output, session) {
       ) %>%
       arrange(elasticity)
   })
-
+  
   # Data tab
   current_table <- reactive({
     if (input$data_view == "cat") {
@@ -1129,11 +1317,11 @@ server <- function(input, output, session) {
                is_playoff, is_weekend, season_year, season_tercile)
     }
   })
-
+  
   output$data_table <- renderDT({
     datatable(current_table(), options = list(pageLength = 15, scrollX = TRUE))
   })
-
+  
   output$download_data <- downloadHandler(
     filename = function() paste0("hurricanes_app_data_", Sys.Date(), ".csv"),
     content = function(file) {
